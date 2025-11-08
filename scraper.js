@@ -1,19 +1,61 @@
+// scraper.js
 const { connect } = require("puppeteer-real-browser");
-const fs = require("fs"); // Currently unused, but kept
-const { get } = require("http"); // Currently unused, but kept
+const fs = require("fs");
+const path = (require = require("path"));
 
-class WorkingUpworkScraper_NoCookie {
+class UpworkScraper {
   constructor() {
     this.browser = null;
     this.page = null;
   }
 
-  // Launch puppeteer-real-browser and optionally load cookies
-  async init(cookieData = null) {
+  // Load cookies from cookies.json (if it exists)
+  async loadCookiesFromFile() {
+    const cookiesPath = path.join(__dirname, "cookies.json");
+    if (!fs.existsSync(cookiesPath)) {
+      console.log("cookies.json not found – continuing without cookies.");
+      return [];
+    }
+
+    try {
+      const raw = fs.readFileSync(cookiesPath, "utf-8");
+      const cookies = JSON.parse(raw);
+      if (Array.isArray(cookies)) {
+        console.log(`Loaded ${cookies.length} cookies from cookies.json`);
+        return cookies;
+      }
+      console.warn("cookies.json is not an array – ignoring.");
+      return [];
+    } catch (err) {
+      console.error("Failed to read cookies.json:", err.message);
+      return [];
+    }
+  }
+
+  // === NEW METHOD: SAVE COOKIES ===
+  async saveCookiesToFile() {
+    if (!this.page) {
+      console.error("Cannot save cookies: Page is not initialized.");
+      return;
+    }
+    try {
+      const cookies = await this.page.cookies();
+      const cookiesPath = path.join(__dirname, "cookies.json");
+      fs.writeFileSync(cookiesPath, JSON.stringify(cookies, null, 2));
+      console.log(`Saved ${cookies.length} cookies to cookies.json.`);
+    } catch (err) {
+      console.error("Failed to save cookies.json:", err.message);
+    }
+  }
+  // ==================================
+
+  // Start browser and load cookies
+  async init() {
     console.log("Initializing Puppeteer Real Browser...");
+
     try {
       const { browser, page } = await connect({
-        headless: true,
+        headless: false,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -30,274 +72,198 @@ class WorkingUpworkScraper_NoCookie {
       this.browser = browser;
       this.page = page;
 
-      // Optional: load cookies if provided
-      if (cookieData && Array.isArray(cookieData) && cookieData.length > 0) {
-        console.log("Attempting to load provided cookies...");
+      // Load cookies from file
+      const cookies = await this.loadCookiesFromFile();
+      if (cookies.length > 0) {
         try {
-          await this.page.setCookie(...cookieData);
-          console.log("Cookies loaded successfully.");
-        } catch (error) {
-          console.error("Failed to set cookies:", error.message);
+          await this.page.setCookie(...cookies);
+          console.log("Cookies applied to page.");
+        } catch (err) {
+          console.error("Failed to set cookies:", err.message);
         }
       }
 
-      // Set a desktop Chrome user agent
       await this.page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
       );
 
       console.log("Puppeteer Real Browser initialized successfully.");
       return true;
-    } catch (error) {
-      console.error("Failed to initialize browser:", error);
+    } catch (err) {
+      console.error("Failed to initialize browser:", err.message);
       return false;
     }
   }
 
-  // Go to a given Upwork URL and wait for Cloudflare to finish
+  async delay(min = 2000, max = 4000) {
+    const ms = Math.random() * (max - min) + min;
+    console.log(`Waiting for ${Math.round(ms / 1000)}s...`);
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   async navigateToUpwork(targetUrl) {
     console.log(`Navigating to Upwork URL: ${targetUrl}`);
+
     try {
       await this.page.goto(targetUrl, {
-        waitUntil: "networkidle2",
-        timeout: 60000,
+        waitUntil: "networkidle0",
+        timeout: 120000,
       });
 
-      await this.waitForCloudflareComplete();
+      await this.waitForJobsToAppear();
+
       await this.delay(3000, 5000);
+      await this.delay(1000, 2000);
+
       console.log("Page loaded successfully.");
       return true;
-    } catch (error) {
-      console.error("Navigation failed:", error);
+    } catch (err) {
+      console.error("Navigation failed:", err.message);
+      try {
+        await this.page.screenshot({
+          path: "debug_navigation_failed.png",
+          fullPage: true,
+        });
+        console.log("Saved debug_navigation_failed.png");
+      } catch (sErr) {
+        console.error("Failed to capture debug screenshot:", sErr.message);
+      }
       return false;
     }
   }
 
-  // Random delay between min/max ms
-  async delay(min = 2000, max = 4000) {
-    const delay = Math.random() * (max - min) + min;
-    console.log(
-      `Waiting for ${Math.round(delay / 1000)}s before proceeding...`
-    );
-    return new Promise((resolve) => setTimeout(resolve, delay));
-  }
-
-  // Wait until Cloudflare challenge is done (approx heuristic)
-  async waitForCloudflareComplete() {
-    console.log("Waiting for Cloudflare checks to complete...");
-    let attempts = 0;
-    const maxAttempts = 20;
-
-    while (attempts < maxAttempts) {
-      attempts++;
-      const title = await this.page.title();
-      const url = this.page.url();
-
-      console.log(
-        `Attempt ${attempts}/${maxAttempts} : Current title is "${title}"`
-      );
-
-      if (
-        url.includes("upwork.com") &&
-        !title.toLowerCase().includes("cloudflare") &&
-        !title.toLowerCase().includes("just a moment") &&
-        !title.toLowerCase().includes("checking")
-      ) {
-        console.log("Cloudflare checks completed.");
-        return true;
-      }
-
-      await this.delay(5000, 8000);
-    }
-
-    console.log("Continuing despite potential Cloudflare checks...");
-    return true;
-  }
-
-  // Find job tiles on the Upwork jobs page using multiple selectors
-  async findJobElements() {
-    console.log("Searching for job elements on the page...");
-
-    const selectors = [
-      'article[data-test="job-tile"]',
-      ".job-tile",
-      ".air3-card.job-tile",
-    ];
-
-    for (const selector of selectors) {
-      try {
-        await this.page.waitForSelector(selector, { timeout: 10000 });
-        const elements = await this.page.$$(selector);
-
-        if (elements.length > 0) {
-          console.log(
-            `Found ${elements.length} job elements using selector: ${selector}`
-          );
-          return { elements, selector };
-        }
-      } catch (error) {
-        console.error(
-          `Error while searching with selector ${selector}:`,
-          error.message
-        );
-      }
-    }
-
-    console.log("No job elements found with any selector.");
-    await this.page.screenshot({ path: "debug_no_jobs.png", fullPage: true });
-    return { elements: [], selector: null };
-  }
-
-  // Scrape jobs from the page
-  async scrapeJobs(maxJobs = 20) {
-    console.log("Starting job scraping process...");
-    const jobs = [];
+  // Wait until job links appear in the DOM (or timeout)
+  async waitForJobsToAppear() {
+    console.log("Waiting for job links to appear on the page...");
 
     try {
-      const { elements: jobElements } = await this.findJobElements();
-
-      if (!jobElements || jobElements.length === 0) {
-        console.log("No job elements found to scrape.");
-        return jobs;
-      }
-
-      const maxJobsToProcess = Math.min(jobElements.length, maxJobs);
-
-      for (let i = 0; i < maxJobsToProcess; i++) {
-        try {
-          const jobData = await jobElements[i].evaluate((el) => {
-            const getText = (selector) => {
-              const node = el.querySelector(selector);
-              return node ? node.textContent.trim() : null;
-            };
-
-            // Job ID from attribute
-            const jobId = el.getAttribute("data-ev-jobuid") || null;
-
-            // Title & URL
-            const titleLink = el.querySelector(
-              'h2 a[href*="/jobs/"], [data-test="job-title-link"]'
-            );
-            const title = titleLink ? titleLink.textContent.trim() : null;
-            const url = titleLink ? titleLink.href : null;
-
-            // Full description
-            const description =
-              getText(
-                '[data-test="UpCLineClamp JobDescription"] p, .air3-line-clamp p'
-              ) || "No description";
-
-            // Budget & experience level
-            let budget = "Not Specified";
-            let experienceLevel = "Not Specified";
-
-            const jobInfoItems = el.querySelectorAll(
-              '[data-test="JobInfo"] li, .job-title-info-list li'
-            );
-
-            jobInfoItems.forEach((item) => {
-              const text = item.textContent.trim();
-
-              if (text.includes("Hourly") || text.includes("Fixed-price")) {
-                budget = text;
-              }
-
-              if (
-                text.includes("Entry") ||
-                text.includes("Intermediate") ||
-                text.includes("Expert")
-              ) {
-                experienceLevel = text;
-              }
-            });
-
-            // Posted time
-            const rawPosted = getText(
-              '[data-test="job-published-date"] small, small.text-light'
-            );
-            const posted = rawPosted
-              ? rawPosted.replace("Posted ", "").trim()
-              : "No posted time";
-
-            // Skills
-            const skills = Array.from(
-              el.querySelectorAll('[data-test="token"] span, .air3-token span')
-            ).map((skillEl) => skillEl.textContent.trim());
-
-            // Client info
-            const paymentText = getText(
-              '[data-test="payment-verification-badge"]'
-            );
-            const paymentVerified =
-              paymentText && paymentText.includes("Payment verified")
-                ? "Verified"
-                : "Unverified";
-
-            const ratingText = getText(".air3-rating-value-text");
-            const rating = ratingText ? `${ratingText} stars` : "No rating";
-
-            const totalSpent =
-              getText("[data-test='total-spent'] strong") ||
-              "No total spent info";
-            const location =
-              getText("[data-test='location']") || "No location info";
-
-            const clientInfo = `{Payment: ${paymentVerified} | Rating: ${rating} | Total Spent: ${totalSpent} | Location: ${location}}`;
-
-            return {
-              jobId,
-              title,
-              url,
-              description,
-              budget,
-              experienceLevel,
-              posted,
-              skills,
-              clientInfo,
-            };
-          });
-
-          if (jobData && jobData.title) {
-            jobs.push({
-              id: jobs.length + 1,
-              ...jobData,
-              scrapedAt: new Date().toISOString(),
-            });
-
-            console.log(
-              `✅ Job ${jobs.length}: [${
-                jobData.jobId
-              }] ${jobData.title.substring(0, 40)}...`
-            );
-          } else {
-            console.log(`⚠️ Skipped job ${i + 1} - no valid title/data found.`);
-          }
-
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.random() * (500 - 200) + 200)
+      await this.page.waitForFunction(
+        () => {
+          const links = Array.from(
+            document.querySelectorAll('a[href*="/jobs/"]')
           );
-        } catch (err) {
-          console.error(`Error scraping job ${i + 1}:`, err.message);
-        }
-      }
-    } catch (error) {
-      console.error("Error during scraping:", error.message);
+          return links.some((a) =>
+            (a.getAttribute("href") || "").includes("/jobs/~")
+          );
+        },
+        { timeout: 90000 }
+      );
+      console.log("Job links detected in DOM.");
+    } catch (err) {
+      console.log(
+        "Timeout waiting for job links. Page may still be on a challenge:",
+        err.message
+      );
     }
-
-    return jobs;
   }
 
-  // Close the browser
+  // Scrape job data from links like /jobs/~XXXX
+  async scrapeJobs(maxJobs = 20) {
+    console.log("Starting job scraping process...");
+
+    try {
+      const rawJobs = await this.page.$$eval(
+        'a[href*="/jobs/"]',
+        (links, maxJobs) => {
+          const results = [];
+          const seen = new Set();
+
+          for (const link of links) {
+            const href = link.href || "";
+            if (!href.includes("/jobs/~")) continue; // only real job detail links
+            if (seen.has(href)) continue;
+            seen.add(href);
+
+            const root =
+              link.closest("article") ||
+              link.closest("section") ||
+              link.closest("div");
+
+            const getText = (selector) => {
+              if (!root) return null;
+              const el = root.querySelector(selector);
+              return el ? el.textContent.trim() : null;
+            };
+
+            const title =
+              link.textContent.trim() || getText("h3, h4") || "No title";
+
+            const description =
+              getText(
+                '[data-test="UpCLineClamp JobDescription"] p, [data-test="job-description-text"], .air3-line-clamp p'
+              ) || "";
+
+            const metaText = Array.from(
+              root ? root.querySelectorAll("li, small, span") : []
+            )
+              .map((el) => el.textContent.trim())
+              .filter(Boolean)
+              .slice(0, 15)
+              .join(" | ");
+
+            const skills = Array.from(
+              root
+                ? root.querySelectorAll(
+                    '[data-test="token"] span, .air3-token span'
+                  )
+                : []
+            ).map((el) => el.textContent.trim());
+
+            results.push({
+              title,
+              url: href,
+              description,
+              meta: metaText,
+              skills,
+            });
+
+            if (results.length >= maxJobs) break;
+          }
+
+          return results;
+        },
+        maxJobs
+      );
+
+      const jobs = rawJobs.map((job, idx) => ({
+        id: idx + 1,
+        ...job,
+        scrapedAt: new Date().toISOString(),
+      }));
+
+      console.log(`Scraped ${jobs.length} jobs.`);
+      if (jobs.length === 0) {
+        try {
+          await this.page.screenshot({
+            path: "debug_no_jobs.png",
+            fullPage: true,
+          });
+          console.log("Saved debug_no_jobs.png for inspection.");
+        } catch (e) {
+          console.error(
+            "Failed to capture debug_no_jobs screenshot:",
+            e.message
+          );
+        }
+      }
+
+      return jobs;
+    } catch (err) {
+      console.error("Error in scrapeJobs:", err.message);
+      return [];
+    }
+  }
+
   async close() {
     try {
       if (this.browser) {
         await this.browser.close();
         console.log("Browser closed successfully.");
       }
-    } catch (error) {
-      console.error("Error occurred while closing the browser:", error.message);
+    } catch (err) {
+      console.error("Error closing browser:", err.message);
     }
   }
 }
 
-module.exports = WorkingUpworkScraper_NoCookie;
+module.exports = UpworkScraper;
